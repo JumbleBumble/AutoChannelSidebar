@@ -6,7 +6,14 @@
 
 import { definePluginSettings } from "@api/Settings";
 import definePlugin, { makeRange, OptionType } from "@utils/types";
-import { GuildChannelStore, SelectedGuildStore } from "@webpack/common";
+import { FluxStore } from "@vencord/discord-types";
+import { findStoreLazy } from "@webpack";
+import {
+    GuildChannelStore,
+    PermissionsBits,
+    PermissionStore,
+    SelectedGuildStore,
+} from "@webpack/common";
 
 const author = { name: "Jumble", id: 1135976262234542233n };
 const MIN_WIDTH = 264;
@@ -14,6 +21,10 @@ const MAX_WIDTH = 600;
 const EXTRA_SPACE = 102;
 const SIDEBAR_STYLE_PROPERTIES = ["width", "min-width", "max-width", "flex-basis", "flex-shrink"];
 const SIDEBAR_PANEL_CLASS = /^sidebar(?:_[\w-]+)?$/;
+
+const CategoryCollapseStore = findStoreLazy("CategoryCollapseStore") as FluxStore & {
+    getCollapsedCategories(): Record<string, boolean>;
+};
 
 let observer: MutationObserver | undefined;
 let frameId: number | undefined;
@@ -27,6 +38,7 @@ let ownedBannerContent: HTMLImageElement | undefined;
 let originalBannerContentWidth: { value: string; priority: string } | undefined;
 let ownedGrid: HTMLElement | undefined;
 let originalGridTemplateColumns: { value: string; priority: string } | undefined;
+let baseGridTemplateColumns: string | undefined;
 let ownedResizeHandle: HTMLElement | undefined;
 let originalResizeHandlePointerEvents: { value: string; priority: string } | undefined;
 let measureCanvas: HTMLCanvasElement | undefined;
@@ -53,7 +65,9 @@ function findSidebar(handle?: HTMLElement): HTMLElement | undefined {
         for (let depth = 0; node && depth < 8; depth++, node = node.parentElement) {
             if (
                 node !== list &&
-                Array.from(node.classList).some(className => SIDEBAR_PANEL_CLASS.test(className)) &&
+                Array.from(node.classList).some(className =>
+                    SIDEBAR_PANEL_CLASS.test(className),
+                ) &&
                 (!list || node.contains(list))
             ) {
                 return node;
@@ -80,7 +94,7 @@ function findSidebarGrid(sidebar: HTMLElement): HTMLElement | undefined {
 function resizeGridTemplate(
     columns: string,
     desiredChannelWidth: number,
-    minimumSidebarWidth: number
+    minimumSidebarWidth: number,
 ): { columns: string; channelWidth: number; sidebarWidth: number } | undefined {
     const guildsEnd = columns.indexOf("[guildsEnd]");
     const channelsEnd = columns.indexOf("[channelsEnd]", guildsEnd + 1);
@@ -132,6 +146,7 @@ function rememberGrid(grid: HTMLElement) {
         value: grid.style.getPropertyValue("grid-template-columns"),
         priority: grid.style.getPropertyPriority("grid-template-columns"),
     };
+    baseGridTemplateColumns = getComputedStyle(grid).gridTemplateColumns;
 }
 
 function rememberChannelList(channelList: HTMLElement) {
@@ -236,6 +251,7 @@ function restoreGrid() {
 
     ownedGrid = undefined;
     originalGridTemplateColumns = undefined;
+    baseGridTemplateColumns = undefined;
 }
 
 function restoreSidebar() {
@@ -256,10 +272,17 @@ function restoreSidebar() {
 
 function getChannelNames(guildId: string): string[] {
     const channels = GuildChannelStore.getChannels(guildId);
+    const collapsedCategories = CategoryCollapseStore.getCollapsedCategories();
+
     return Object.values(channels).flatMap(value =>
         Array.isArray(value)
             ? value
-                  .map(entry => entry.channel.name)
+                  .filter(
+                      ({ channel }) =>
+                          PermissionStore.can(PermissionsBits.VIEW_CHANNEL, channel) &&
+                          !collapsedCategories[channel.parent_id],
+                  )
+                  .map(({ channel }) => channel.name)
                   .filter((name): name is string => typeof name === "string")
             : [],
     );
@@ -316,7 +339,7 @@ function update() {
         ? Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, configuredMinimum))
         : MIN_WIDTH;
     const resizedGrid = resizeGridTemplate(
-        getComputedStyle(grid).gridTemplateColumns,
+        baseGridTemplateColumns ?? getComputedStyle(grid).gridTemplateColumns,
         Math.ceil(longest + EXTRA_SPACE),
         minimumWidth,
     );
@@ -352,8 +375,25 @@ export default definePlugin({
     start() {
         SelectedGuildStore.addChangeListener(schedule);
         GuildChannelStore.addChangeListener(schedule);
-        observer = new MutationObserver(schedule);
-        observer.observe(document.body, { childList: true, subtree: true });
+        CategoryCollapseStore.addChangeListener(schedule);
+        observer = new MutationObserver(mutations => {
+            if (
+                mutations.some(
+                    mutation =>
+                        mutation.type === "childList" ||
+                        (mutation.target instanceof Element &&
+                            mutation.target.closest('[class*="sidebarList"], [class*="channelList"]')),
+                )
+            ) {
+                schedule();
+            }
+        });
+        observer.observe(document.body, {
+            attributes: true,
+            attributeFilter: ["aria-expanded", "class"],
+            childList: true,
+            subtree: true,
+        });
         schedule();
     },
 
@@ -362,6 +402,7 @@ export default definePlugin({
         observer = undefined;
         SelectedGuildStore.removeChangeListener(schedule);
         GuildChannelStore.removeChangeListener(schedule);
+        CategoryCollapseStore.removeChangeListener(schedule);
         if (frameId !== undefined) cancelAnimationFrame(frameId);
         frameId = undefined;
         restoreSidebar();
